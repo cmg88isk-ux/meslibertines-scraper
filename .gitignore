@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.bak
+credentials.txt
+
+# Real scraped data: contains passwords, addresses and contract numbers.
+result/
+*_dump.json
+*_dump.txt
+yomoni_results.txt
+diag_*.json
+diagnostic_*.json
+verify-*.jsonl
+
+# One-off exploration scripts from earlier sessions
+diag_auth.py
+diag_yomoni.py
+explore_yomoni.py
+login_yomoni.py
+scrape_yomoni_account.py
+KernelBrowser.py
+scrape_afer.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

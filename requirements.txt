@@ -1,0 +1,7 @@
+# Runtime dependencies.
+#
+# Note: no local browser binary is needed. Playwright is driven over CDP against
+# a cloud browser, so "playwright install chromium" is deliberately absent -
+# installing a local Chromium would add ~150 MB for nothing.
+httpx>=0.27
+playwright>=1.44
