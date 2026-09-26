@@ -136,10 +136,52 @@ def test_failure_markers_never_look_like_passwords() -> None:
     check("marqueur: vrai mdp", is_success_line("VraiMotDePasse1!"))
 
 
-def test_credentials_dedupe() -> None:
-    accounts = sm.read_all_credentials()
-    pairs = [(e, p) for e, p in accounts]
-    check("credentials: pas de doublon exact", len(pairs) == len(set(pairs)), f"n={len(pairs)}")
+def test_credentials_parser() -> None:
+    """Parser checks run on a fixture, not on the real credentials.txt.
+
+    credentials.txt is gitignored on purpose, so a fresh clone has none: a test
+    that reads it fails everywhere except the machine that produced it. That
+    is exactly what a clone test caught.
+    """
+    fixture = os.path.join(tempfile.mkdtemp(prefix="yomoni-creds-"), "credentials.txt")
+    with open(fixture, "w", encoding="utf-8") as f:
+        f.write(
+            "# commentaire\n"
+            "\n"
+            "dup@example.com:motdepasse1\n"
+            "DUP@example.com:motdepasse1\n"      # doublon exact, meme casse differente
+            "AUTRE@Example.com:motdepasse2\n"
+            "sans-separateur\n"
+            "vide@example.com:\n"
+            ":orphelin\n"
+            "deux@example.com:p1\n"
+            "deux@example.com:p2\n"              # meme mail, mdp differents
+        )
+    accounts = sm.read_all_credentials(fixture)
+    emails = [e for e, _ in accounts]
+    pairs = set(accounts)
+    check("parser: doublon exact ecarte", len(pairs) == len(accounts), f"-> {accounts}")
+    check("parser: email normalise", all(e == e.lower() for e in emails), f"-> {emails}")
+    check("parser: ligne sans ':' ignoree", "sans-separateur" not in emails)
+    check("parser: champ vide ignore", "vide@example.com" not in emails)
+    check("parser: orphelin ignore", "" not in emails)
+    check("parser: commentaire ignore", len(accounts) == 4, f"-> {len(accounts)}")
+    # Both passwords for one address are kept: that is how a corrected password
+    # gets tested without erasing the history of the previous one.
+    check(
+        "parser: 2 mdp pour un meme mail conserves",
+        sum(1 for e, _ in accounts if e == "deux@example.com") == 2,
+    )
+
+
+def test_real_credentials_if_present() -> None:
+    """Extra check on the live file, skipped when there is none."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.txt")
+    if not os.path.exists(path):
+        print("  SKIP  fichier credentials.txt absent (normal sur un clone)")
+        return
+    accounts = sm.read_all_credentials(path)
+    check("credentials: aucun doublon exact", len(accounts) == len(set(accounts)))
     check("credentials: emails normalises", all(e == e.lower() for e, _ in accounts))
     check("credentials: aucun champ vide", all(e and p for e, p in accounts))
 
@@ -173,7 +215,8 @@ async def main() -> int:
     await test_success_is_never_overwritten_by_failure()
     test_failure_markers_never_look_like_passwords()
     test_attempt_key_distinguishes_passwords()
-    test_credentials_dedupe()
+    test_credentials_parser()
+    test_real_credentials_if_present()
     print("transports")
     test_transport_error_classification()
     print()

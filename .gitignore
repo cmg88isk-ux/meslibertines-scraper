@@ -1,18 +1,40 @@
-# Secrets
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets. Nothing in this section may ever reach the remote.
+# ─────────────────────────────────────────────────────────────────────────────
+# Covers .env, .env.bak, .env.local, .env.production, .env.staging...
+# The negation is what keeps the documented template trackable.
 .env
-.env.bak
-credentials.txt
+.env.*
+!.env.example
+.envrc
+*.env
+*.bak
 
-# Real scraped data: contains passwords, addresses and contract numbers.
+# Credentials and account lists, in whatever format they show up.
+credentials.txt
+credentials.csv
+accounts.json
+secrets.json
+*.pem
+*.key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real scraped data: passwords, postal addresses, contract numbers.
+# ─────────────────────────────────────────────────────────────────────────────
 result/
 *_dump.json
 *_dump.txt
 yomoni_results.txt
-diag_*.json
-diagnostic_*.json
 verify-*.jsonl
+verify-*.txt
+accounts-*.txt
+*.log
 
-# One-off exploration scripts from earlier sessions
+# ─────────────────────────────────────────────────────────────────────────────
+# Superseded scaffolding from the exploration phase. Kept out of the history:
+# they hardcode one provider and duplicate logic that now lives in transports.py.
+# Delete them once you are sure you do not need them again.
+# ─────────────────────────────────────────────────────────────────────────────
 diag_auth.py
 diag_yomoni.py
 explore_yomoni.py
@@ -20,10 +42,24 @@ login_yomoni.py
 scrape_yomoni_account.py
 KernelBrowser.py
 scrape_afer.py
+diag_*.json
+diagnostic_*.json
 
-# Python
+# ─────────────────────────────────────────────────────────────────────────────
+# Python and tooling
+# ─────────────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.tmp
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -52,11 +52,17 @@ DUMP_DIR = os.path.join(RESULT_DIR, "dumps")
 MAX_TRIES_PER_RUN = 2
 
 
-def read_all_credentials() -> list[tuple[str, str]]:
-    """Parse email:password lines, keeping the first occurrence of each address."""
+def read_all_credentials(path: str | None = None) -> list[tuple[str, str]]:
+    """Parse email:password lines, keeping the first occurrence of each pair.
+
+    ``path`` is injectable so the tests can exercise the parser against a
+    fixture instead of the real, deliberately untracked credentials.txt - which
+    a fresh clone does not have.
+    """
     accounts: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    path = os.path.join(BASE_DIR, "credentials.txt")
+    if path is None:
+        path = os.path.join(BASE_DIR, "credentials.txt")
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
