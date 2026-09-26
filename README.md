@@ -264,13 +264,47 @@ reaches: 7  blocked: 0  total: 7
 page met environ 8 s à hydrater : interroger le DOM plus tôt décrit à tort une
 page saine comme vide.
 
-Pour l'état des crédits :
+### Lancer le checker
 
 ```bash
-python check_credits.py              # état de chaque clé
-python check_credits.py --probe      # ouvre et ferme une vraie session par clé
-python check_credits.py --write-bak  # parke les clés épuisées dans .env.bak
+python check_credits.py              # lecture seule, gratuit, aucun credit
+python check_credits.py --probe      # ouvre et ferme une vraie session par cle
+python check_credits.py --json       # sortie brute pour un script
+python check_credits.py --write-bak  # parque les cles epuisees dans .env.bak
 ```
+
+Deux modes, et la difference est importante :
+
+| Mode | Ce qu'il fait | Cout |
+|---|---|---|
+| sans `--probe` | Lit `/subscription/`, `/org/limits`, `/v1/projects` | gratuit |
+| `--probe` | Cree puis detruit une vraie session par cle | consomme du credit |
+
+**Le mode gratuit ne detecte pas une cle epuisee.** Mesure faite le
+26/09/2026 sur `BROWSERBASE_API_KEY` :
+
+```
+sans --probe   -> [OK    ] browserbase BROWSERBASE_API_KEY ***7Kwitw http=200
+avec --probe   -> [SPENT ] browserbase BROWSERBASE_API_KEY ***7Kwitw http=402
+                 Free plan browser minutes limit reached.
+```
+
+`/v1/projects` renvoie 200 meme a zero credit : c'est une lecture de catalogue,
+pas de la consommation. Seul le probe consomme une minute et dit la verite.
+Quand un doute sur la consommation, `--probe` est le seul verdict fiable.
+
+**Codes de sortie** : `0` si aucune cle epuisee ou rejetee, `1` sinon. Donc
+utilisable tel quel comme garde-fou dans un script :
+
+```bash
+python check_credits.py || echo "au moins une cle est epuisee"
+```
+
+`--write-bak` fait deux choses : il commente la cle epuisee dans `.env` (elle
+sort donc du pool du scraper) et l'archive avec sa date de reset estimee dans
+`.env.bak`, ou elle sera reappliquee au prochain cycle. C'est ce qui evite au
+scraper de retenter une cle qui renvoie 402 a chaque run.
+
 
 ## Tests
 
