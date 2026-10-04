@@ -24,6 +24,14 @@ secrets.json
 result/
 *_dump.json
 *_dump.txt
+meslibertines-profile/
+meslibertines-state.json
+# Comptes en entree et verdicts en sortie: jamais committes.
+targets/*
+!targets/.gitkeep
+!targets/accounts.txt.example
+output/*
+!output/.gitkeep
 yomoni_results.txt
 verify-*.jsonl
 verify-*.txt

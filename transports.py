@@ -19,7 +19,6 @@ understands, so adding a key to .env is enough to widen the pool.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -112,9 +111,14 @@ class BrowserbaseTransport:
 
     name = "browserbase"
 
-    def __init__(self, keys: list[str], *, timeout_s: int = DEFAULT_TIMEOUT_S) -> None:
+    def __init__(
+        self, keys: list[str], *, timeout_s: int = DEFAULT_TIMEOUT_S, settings: dict[str, Any] | None = None
+    ) -> None:
         self._keys = keys
         self.timeout_s = timeout_s
+        # Per-session overrides merged into browserSettings, e.g. a random
+        # fingerprint so each attempt does not reuse the same one.
+        self.settings = settings or {}
 
     def keys(self) -> list[str]:
         return list(self._keys)
@@ -137,7 +141,7 @@ class BrowserbaseTransport:
                     headers={"X-BB-API-Key": key, "Content-Type": "application/json"},
                     json={
                         "projectId": project_id,
-                        "browserSettings": dict(_BROWSER_SETTINGS),
+                        "browserSettings": {**_BROWSER_SETTINGS, **self.settings},
                         "timeout": self.timeout_s,
                     },
                 )
@@ -170,9 +174,13 @@ class KernelTransport:
 
     name = "kernel"
 
-    def __init__(self, keys: list[str], *, timeout_s: int = DEFAULT_TIMEOUT_S) -> None:
+    def __init__(
+        self, keys: list[str], *, timeout_s: int = DEFAULT_TIMEOUT_S, settings: dict[str, Any] | None = None
+    ) -> None:
         self._keys = keys
         self.timeout_s = timeout_s
+        # Extra fields merged into the create payload (locale, timezone, ...).
+        self.settings = settings or {}
 
     def keys(self) -> list[str]:
         return list(self._keys)
@@ -190,6 +198,7 @@ class KernelTransport:
                         # comes with it.
                         "stealth": True,
                         "timeout_seconds": self.timeout_s,
+                        **self.settings,
                     },
                 )
             except httpx.HTTPError as exc:
@@ -249,10 +258,3 @@ async def open_browser(transport: Transport, key: str) -> Any:
         with contextlib.suppress(Exception):
             await pw.stop()
         await session.close()
-
-
-def iter_keys(transports: list[Transport]) -> Iterator[tuple[str, str]]:
-    """Yield (transport_name, key) across every transport, in priority order."""
-    for transport in transports:
-        for key in transport.keys():
-            yield transport.name, key

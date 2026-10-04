@@ -1,14 +1,14 @@
-# Yomoni Scraper
+# MesLibertines Checker
 
-Scraper multi-comptes pour l'espace client `my.yomoni.fr`.
+Vérificateur de comptes pour `meslibertines.com`.
 
-Lit une liste de comptes, se connecte à chacun, parcourt l'espace membre et
-produit **une ligne de résultat par compte**. Les navigateurs vivent chez
-Browserbase et Kernel, pilotés en CDP : le code ne dépend d'aucun navigateur
-local.
-
-État actuel : **22 comptes traités** (23 lignes : une adresse porte deux mots de
-passe différents, tous deux essayés), 8 réussis, 16 rejetés, 0 en attente.
+Lit une liste de comptes, ouvre un navigateur cloud neuf pour chacun, franchit le
+challenge Cloudflare/Turnstile, se connecte, puis classe le compte : nature
+(`membre` client ou `escort` annonceur), type (`femme` / `homme` / `couple` /
+`trans`), abonnement `premium` payé ou non, date d'inscription et dernière
+connexion. Un mot de passe refusé est écrit `password=false`, preuve du site à
+l'appui. Les navigateurs vivent chez Kernel et Browserbase, pilotés en CDP :
+aucun navigateur local n'est requis.
 
 ---
 
@@ -19,10 +19,9 @@ passe différents, tous deux essayés), 8 réussis, 16 rejetés, 0 en attente.
 - [Installation](#installation)
 - [Utilisation](#utilisation)
 - [Format des résultats](#format-des-résultats)
-- [Définitif contre transitoire](#définitif-contre-transitoire)
+- [Types de comptes](#types-de-comptes)
 - [Modèle anti-détection](#modèle-anti-détection)
 - [Résilience](#résilience)
-- [Vérifier avant de lancer](#vérifier-avant-de-lancer)
 - [Tests](#tests)
 - [Sécurité](#sécurité)
 
@@ -30,63 +29,60 @@ passe différents, tous deux essayés), 8 réussis, 16 rejetés, 0 en attente.
 
 ## Ce que fait le programme
 
-Pour chaque compte de `credentials.txt` :
+Pour chaque compte de `targets/` :
 
-1. ouvre un navigateur cloud neuf (flush complet des cookies) ;
-2. applique une identité propre à la session (IP, User-Agent, langues) ;
-3. se connecte sur `my.yomoni.fr/sign-in` ;
-4. parcourt `/home`, `/profile`, `/notifications`, `/news` et l'assistant de
-   souscription s'il y en a un ;
-5. extrait produit, montant, adresse, téléphone et detalle ;
-6. écrit **une ligne** dans `result/yomoni_results.txt` et un dump JSON complet
-   dans `result/dumps/`.
-
-Un compte qui n'aboutit pas est enregistré avec un marqueur explicite
-(`mot de passe changé`, `2FA requise`) : on sait toujours *pourquoi* il est vide.
+1. ouvre une session cloud neuve (donc une **nouvelle IP**) ;
+2. applique une identité propre à la session (User-Agent calé sur le vrai build
+   Chrome, Client Hints cohérents, locale/timezone, assets bloqués) ;
+3. charge `meslibertines.com/users/login/` et attend que le challenge Cloudflare
+   passe ;
+4. masque l'overlay d'avertissement majeur (`#windiv-confirm`) ;
+5. remplit `#user` / `#passwd` et soumet ;
+6. si le site répond *« Nom d'utilisateur ou mot de passe invalide! »*, écrit
+   `password=false` ; sinon récupère le dash et le profil public et classe le
+   compte (nature, type, premium, dates) ;
+7. écrit une ligne dans `output/valid.txt` (ou `invalids.txt`) et la table
+   complète dans `output/results.txt` / `output/results.json`.
 
 ## Architecture
 
-Chaque module a une responsabilité unique, ce qui permet de remplacer une pièce
-sans toucher aux autres.
+Chaque module a une responsabilité unique.
 
 | Module | Rôle |
 |---|---|
 | `config.py` | Lit `.env`, rassemble le pool de clés d'un fournisseur |
 | `transports.py` | Abstraction fournisseur : une clé → un Chrome joignable en CDP |
-| `hygiene.py` | Flush, identité de session, blocage des assets |
-| `yomoni.py` | Connexion et parcours du site, indépendant du fournisseur |
-| `extract.py` | Texte capturé → une ligne de résultat (fonctions pures) |
-| `scrape_multi.py` | Orchestrateur : concurrence, rotation, persistance |
-| `probe_reach.py` | Teste quelles clés atteignent vraiment le site |
-| `check_credits.py` | État des crédits de chaque fournisseur |
+| `hygiene.py` | Identité de session (UA + hints + timezone), blocage des assets |
+| `login_meslibertines.py` | Connexion d'un compte (cloud ou navigateur local) |
+| `meslibertines_profile.py` | Texte de profil → nature + type + premium + dates (fonctions pures) |
+| `check_meslibertines.py` | Orchestrateur : `targets/` → `output/`, rotation IP/provider |
 | `test_offline.py` | Tests, sans navigateur ni crédit |
 
-Le point clé de `transports.py` : **Browserbase et Kernel sont interchangeables**.
-Les deux expose une URL CDP, donc le même code de connexion sert pour les deux.
-Aucun SDK propriétaire n'est requis à l'exécution.
+Point clé de `transports.py` : **Kernel et Browserbase sont interchangeables**.
+Les deux exposent une URL CDP, donc le même code sert pour les deux. Aucun SDK
+propriétaire n'est requis à l'exécution.
 
 ```
-credentials.txt
+targets/*.txt
       │
       ▼
   config.py ──── pool de clés
       │
       ▼
-  transports.py ──── Browserbase / Kernel  ──►  Chrome en CDP
+  transports.py ──── Kernel / Browserbase  ──►  Chrome en CDP
       │                                              │
-      │                                    hygiene.py (flush + identité)
+      │                                    hygiene.py (identité)
       ▼                                              │
-  yomoni.py  (connexion + parcours)  ◄────────────────┘
+  login_meslibertines.py  ◄──────────────────────────┘
       │
       ▼
-  extract.py  ──►  scrape_multi.py  ──►  result/
+  meslibertines_profile.py  ──►  check_meslibertines.py  ──►  output/
 ```
 
 ## Installation
 
 ```bash
-git clone https://github.com/cmg88isk-ux/yomoni-scraper
-cd yomoni-scraper
+cd new-scraper
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -94,217 +90,206 @@ pip install -r requirements.txt
 cp .env.example .env      # puis remplir les clés
 chmod 600 .env            # les clés sont des secrets
 
-cp credentials.txt.example credentials.txt   # puis remplir email:motdepasse
-chmod 600 credentials.txt
+mkdir -p targets output
+cp targets/accounts.txt.example targets/accounts.txt   # puis remplir user:motdepasse
+chmod 600 targets/accounts.txt
 ```
 
-`credentials.txt` : un compte par ligne, `email:motdepasse`, sans espace autour
-du `:`. Les doublons exacts et les lignes de commentaire sont ignorés. Si une
-adresse apparaît avec deux mots de passe différents, **les deux sont essayés** :
-c'est la façon de tester un mot de passe corrigé sans perdre l'historique.
+`.env` :
+
+| Variable | Rôle |
+|---|---|
+| `ML_USERNAME` / `ML_PASSWORD` | compte unique utilisé par `login_meslibertines.py` |
+| `KERNEL_API_KEY` | Chrome furtif Kernel (voie fiable). Pool : `KERNEL_API_KEY_2`, `_3`, ... |
+| `BROWSERBASE_API_KEY` | Chrome cloud Browserbase (secours, fingerprint aléatoire). Pool : `_2`, `_3`, ... |
+| `WEBSHARE_API_TOKEN` | optionnel, proxy résidentiel pour le mode local |
+
+Plusieurs clés peuvent coexister pour chaque fournisseur (`..._API_KEY`,
+`..._API_KEY_2`, `_3`, ...) : elles forment un pool. Au démarrage, chaque clé est
+validée gratuitement (`GET /browsers` côté Kernel, `GET /v1/projects` côté
+Browserbase) ; une clé désactivée (401) est écartée, une clé qui répond est
+conservée. Les comptes sont répartis sur le pool et un échec transitoire bascule
+sur la clé suivante, puis sur l'autre fournisseur. Toutes les clés valides
+restent dans la chaîne de fallback.
+
+`targets/*.txt` : un compte par ligne, `user:motdepasse`. Les lignes vides et
+les lignes commençant par `#` sont ignorées, les doublons exacts aussi.
+`targets/` et `output/` sont ignorés par git.
 
 ## Utilisation
 
 ```bash
-# Lancer le traitement (reprend où il s'était arrêté)
-python scrape_multi.py
+# Vérifier tous les comptes de targets/  -> output/  (reprise automatique)
+python check_meslibertines.py
 
-# Voir le plan sans dépenser le moindre crédit
-python scrape_multi.py --dry-run
+# Plus de tentatives par compte (nouvelle IP à chaque essai)
+python check_meslibertines.py --tries 2
 
-# Revérifier un compte précis, en ignorant le verdict mémorisé
-python scrape_multi.py --account someone@example.com
+# Plusieurs comptes en parallele (N workers = N cles, defaut: nb de cles, max 8)
+python check_meslibertines.py --concurrency 8
 
-# Tout revérifier
-python scrape_multi.py --all
+# Tout re-tester, même les comptes déjà résolus
+python check_meslibertines.py --redo
 
-# Retester aussi les comptes bloqués par 2FA
-python scrape_multi.py --retry-failed
+# Replier sur Browserbase en premier (fingerprint aléatoire)
+python check_meslibertines.py --order browserbase,kernel
 
-# Limiter à N comptes, pour valider la chaîne de bout en bout
-python scrape_multi.py --limit 2
+# Désactiver le spoof d'identité (debug)
+python check_meslibertines.py --no-hygiene
+
+# Sauter le préflight des clés (déconseillé)
+python check_meslibertines.py --no-preflight
 ```
 
-La reprise est automatique : relancer le programme ne reprocesse jamais un
-compte déjà résolu. Le `--dry-run` est le bon réflexe avant un run long.
+**Reprise = économie de crédits.** Un compte déjà résolu (`ok` ou
+`password=false`) n'est **jamais** re-testé : relancer le checker ne paie que ce
+qui reste. La sortie est écrite après **chaque** compte (sous verrou), donc un
+Ctrl-C ou un `kill` conserve tout ce qui est déjà traité ; il suffit de relancer.
+Par défaut `--tries 2` : la seconde session n'est ouverte que pour un blocage
+transitoire (un mot de passe refusé s'arrête au premier essai, sans fallback
+inutile). Les échecs transitoires (`challenge`, `error`) ne sont pas enregistrés
+comme définitifs et reviennent au prochain run, sans repayer les comptes réussis.
+
+**Parallélisme.** `--concurrency N` fait tourner N comptes en même temps, chacun
+sur une clé/IP distincte (défaut : nombre de clés, plafonné à 8). Sur un gros
+`targets/`, c'est ce qui rend le run praticable (≈5 min/100 comptes au lieu de
+≈20 min).
+
+**Plus de clés.** Si une clé répond 402/401 (crédits épuisés ou refusée), elle
+est retirée du pool en cours de route. Quand il n'en reste aucune, le run
+s'arrête et affiche `PLUS DE CLES DISPONIBLES: ...` avec le nombre de comptes non
+testés ; ajoute/remplace des clés dans `.env` et relance (la reprise ne refait
+pas les comptes déjà résolus).
+
+**Préflight.** Avant tout lancement, chaque clé du pool est validée par une
+lecture gratuite (`GET /browsers` côté Kernel). Une clé désactivée est écartée
+immédiatement ; aucune session n'est ouverte tant que le pool n'est pas sain.
+
+Connexion d'un seul compte (outil de mise au point) :
+
+```bash
+python login_meslibertines.py --via kernel --tries 3 --dump   # voie fiable
+python login_meslibertines.py --via browserbase               # secours
+python login_meslibertines.py --via local --chrome --manual   # navigateur local, Turnstile manuel
+```
+
+`--chrome` pilote le vrai Chrome installé, `--manual` laisse cliquer le
+Turnstile à la main (utile sur IP résidentielle), `--dump` indique où la session
+a été sauvegardée.
 
 ## Format des résultats
 
-`result/yomoni_results.txt`, une ligne par compte, 6 champs séparés par `|`,
-dans cet ordre :
+Cinq fichiers dans `output/`, réécrits après chaque compte. Chaque fichier
+commence par une **ligne d'en-tête** indiquant les colonnes :
 
-```
-email | mot de passe | 4 derniers chiffres | adresse | produit | détail
-```
-
-Exemple **fictif**, avec la forme exacte d'une vraie ligne :
-
-```
-prenom.nom@example.com|********|||oui|type: assurance-vie (Épargne - Assurance-vie); montant 0,00 €; versement +0,00 €; souscription 1/5 Projet; maj 10/09/2025 à 17h00
-autre.compte@example.com|********|6241|12 rue Exemple, 75000, PARIS|non|type: aucun produit (ni assurance-vie, ni epargne immobiliere); solde 0,00 €; versement +0,00 €
-```
-
-| Champ | Contenu |
+| Fichier | Contenu |
 |---|---|
-| 1 | Adresse du compte |
-| 2 | Mot de passe, ou `mot de passe changé` / `2FA requise` |
-| 3 | 4 derniers chiffres du téléphone (jamais le numéro complet) |
-| 4 | Adresse postale |
-| 5 | `oui` / `non` (assurance-vie) ou `inconnu` |
-| 6 | Type de produit, montants, étape de souscription, date de mise à jour |
+| `valid.txt` | comptes OK : `mail:mdp\|kind\|type\|label\|premium\|inscrit\|last_seen` |
+| `invalids.txt` | comptes non OK : `mail:mdp\|cause\|detail` |
+| `results.txt` | table complète : `mail:mdp\|status\|kind\|type\|label\|premium\|inscrit\|last_seen\|ip\|provider\|detail` |
+| `results.json` | mêmes lignes, structurées (sert aussi à la reprise) |
+| `history.txt` | journal append-only, jamais tronqué (`date\|mail:mdp\|status\|kind\|type\|premium\|ip\|provider\|detail`) |
 
-Un libellé de produit non reconnu est signalé (`libelle inconnu: ...`) plutôt
-que d'être silencieusement classé « aucun produit ». C'est volontaire : une
-épargne immobilière n'est pas une assurance-vie, et la distinguer à tort
-fausse le résultat.
+`kind` = `membre` ou `escort`. `premium` = `oui` / `non` pour un compte
+annonceur (bloc `Abonnement` du dash : `.free-package` → `non`, paquet actif →
+`oui`), vide pour un membre (pas d'abonnement).
 
-Le dump complet de chaque compte est dans `result/dumps/<email>.json`.
+`invalids.txt` distingue la cause : `password=false` (refus franc du site,
+preuve à l'appui), `challenge` (Cloudflare non franchi, rejouable), `noform`,
+`error`. Seuls `ok` et `password=false` sont définitifs et donc sautés à la
+reprise.
 
-## Définitif contre transitoire
+Exemple **fictif** :
 
-C'est la distinction la plus importante du programme, et celle qui évite les
-minutes de navigateur perdues.
+```
+# valid.txt
+mail:mdp|kind|type|label|premium|inscrit|last_seen
+EudesFre:********|membre|m|homme||11/01/2023|04/10/2026 16:38
+simerius:********|escort|f|femme|non|
 
-**Définitif** — la réponse ne changera pas, on n'insiste jamais :
+# invalids.txt
+mail:mdp|cause|detail
+quelquun@example.com:********|password=false|identifiants invalides (site)
+autre@example.com:********|challenge|
+```
 
-| Verdict | Signification |
+Dans `results.txt`, les champs sont : couple testé, statut, nature (`kind`),
+code type, libellé, premium, inscription, dernière connexion, IP de sortie,
+provider + 6 derniers caractères de la clé, détail. `password=false` n'est écrit
+que si le formulaire s'est bien rendu et que le site a répondu par son message
+d'échec : un challenge non résolu ne peut donc pas être confondu avec un mauvais
+mot de passe.
+
+## Types de comptes
+
+Le parser reconnaît tout ce que le site expose. La **nature** se lit à
+l'atterrissage après connexion (et sur l'URL du profil) :
+
+| Nature (`kind`) | Dashboard | Profil | Type |
+|---|---|---|---|
+| `membre` (client) | `/member_dashes/` | `/member/<slug>/` | genre du compte |
+| `escort` (annonceur) | `/profiles/dash/` | `/escort/<slug>-<id>/` | genre de l'annonce + premium |
+
+Le sous-type vient du genre déclaré (`data[gender]` du formulaire d'édition pour
+un membre, panneau `Sexe:` du profil public sinon), avec les **mêmes codes que le
+site** :
+
+| Code | Libellé |
 |---|---|
-| `ok` | Compte lu, données enregistrées |
-| `bad_credentials` | Le portail a refusé le couple |
-| `needs_2fa` | Code à temps de saisir, impossible en lot |
+| `f` | femme |
+| `m` | homme |
+| `c` | couple |
+| `t` | trans (Transexuelle) |
 
-**Transitoire** — le site, la clé ou le réseau a posé problème, donc on retente
-sur une autre IP, au run suivant si besoin : `blocked`, `unknown`, session
-perdue, clé en erreur réseau.
+Le **premium payé** ne concerne que les annonceurs : il est lu dans le bloc
+`Abonnement` du dash (`non` si `.free-package` « vous ne disposez pas d'un
+paquet », `oui` si un paquet est actif, vide pour un membre).
 
-Seuls les verdicts définitifs sont écrits dans `result/attempted.json`. Un
-compte bloqué par un WAF n'est donc **jamais** marqué comme traité, et revient
-tout seul au run suivant.
-
-Corollaire important : **une donnée réelle n'est jamais écrasée par un échec.**
-Si un compte avait déjà été lu avec succès, une tentative échouée ultérieure est
-ignorée et la ligne valide est conservée.
+La meta description est ignorée volontairement : pour un profil trans elle
+indique tout de même « femme », seul le panneau `Sexe:` fait foi.
 
 ## Modèle anti-détection
 
-Repris du modèle du projet frère [vc-login](https://github.com/cmg88isk-ux/vc-login),
-adapté au cas où le navigateur est chez un tiers plutôt que derrière un proxy.
+**IP qui change.** Chaque tentative ouvre une session neuve, et Kernel comme
+Browserbase sortent d'une IP différente à chaque session (vérifié : 6 sessions
+Kernel = 6 IP distinctes). Aucun code de rotation n'est nécessaire au-delà du
+choix de la clé.
 
-**Flush systématique.** Chaque compte part d'un `BrowserContext` neuvoir
-(`new_clean_context`) : aucun cookie, `localStorage` ou `sessionStorage` ne
-passe d'un compte à l'autre. Réutiliser le contexte par défaut ferait fuiter la
-session précédente, et ce genre d'anomalie d'état est exactement ce qu'un
-moteur antifraude note.
+**Fingerprint.** Le User-Agent n'est **jamais** forcé sur une version plus
+ancienne que le navigateur réel : ce désaccord faisait boucler le challenge
+Turnstile. `hygiene.apply_identity` injecte à la place un UA épinglé au vrai
+build Chrome, avec des Client Hints cohérents, une locale/timezone française et
+le blocage des analytics/polices/médias (`Network.setBlockedURLs`). Côté
+Browserbase, une empreinte aléatoire (taille d'écran, viewport, langue) est
+passée à la création de session.
 
-**Identité propre à chaque session.** User-Agent desktop tiré au sort, *épinglé
-à la version de Chrome que le fournisseur a réellement lancée*, et injecté avec
-des Client Hints cohérents. C'est le point qui compte : les serveurs comparent
-`User-Agent` et `sec-ch-ua`, et un couple incohérent trahit davantage que
-l'une ou l'autre valeur prise isolément. `navigator.webdriver` est redéfini, la
-pile de langues est plausible et sans doublon.
-
-**Rotation d'IP.** Aucune ligne de code : chaque session Browserbase et chaque
-navigateur Kernel sort déjà de sa propre IP. Quand un compte revient bloqué ou
-que le navigateur plante, la clé est marquée « déjà essayée » pour ce compte et
-la tentative repart sur une autre IP.
-
-**Assets bloqués.** Analytics, tags, polices et médias sont bloqués en CDP
-(`Network.setBlockedURLs`). Cela réduit la surface d'empreinte et accélère
-nettement chaque parcours.
+**Rotation des providers.** Le checker alterne Kernel et Browserbase, et les
+clés entre elles : une nouvelle tentative ne réutilise jamais l'IP qui vient
+d'échouer.
 
 **Note :** ce sont des mesures d'hygiène, pas une garantie. Rien ne garantit un
-blocage zéro, et le code est conçu pour que ça n'entraîne aucune perte de
-données.
+blocage zéro.
 
 ## Résilience
 
-Ce que le programme absorbe sans s'arrêter :
+- **Challenge Cloudflare non résolu** : la tentative repart sur une session
+  neuve (autre IP) jusqu'à `--tries`, puis `challenge` est écrit.
+- **Mauvais mot de passe** : verdict définitif `password=false`, pas de retry
+  inutile — confirmé par le message du site.
+- **Provider en erreur** (429 Browserbase, session perdue) : la tentative
+  repart, l'échec d'un compte n'interrompt pas le run.
+- **Clé épuisée** : retirée du pool dès le 402/401 ; quand toutes le sont, le run
+  s'arrête avec `PLUS DE CLES DISPONIBLES` et le nombre de comptes restants.
+- **Reprise** : les fichiers de `output/` sont réécrits après chaque compte, et
+  `history.txt` est append-only. Un Ctrl-C/`kill` ne perd rien et un relaunch
+  saute les comptes déjà résolus (`ok` / `password=false`), donc ne repaie pas
+  les crédits déjà dépensés.
+- **Refus franc** : dès que le site imprime son message d'invalidité, la
+  tentative s'arrête sans attendre la fin du délai (économie de minutes).
 
-- **Clé en rupture de crédits** (HTTP 402) : retirée du pool pour le reste du
-  run, les autres workers prennent le relais. Constaté en conditions réelles.
-- **Navigateur cloud qui plante** (`TargetClosedError`, timeout) : c'est une
-  mauvaise session, pas un verdict sur le compte ; la tentative repart sur une
-  autre IP.
-- **Une clé qui ne revient pas au pool** : ce bug a produit dix faux échecs en
-  cascade avant d'être corrigé. Le chemin critique est désormais couvert par un
-  test, et la règle est explicite dans le code : une clé retourne toujours au
-  pool, sauf si elle a été déclarée morte.
-- **Interruption Ctrl+C** : les comptes déjà traités sont enregistrés au fur et
-  à mesure. Rien n'est perdu, il suffit de relancer.
-- **Écriture atomique** : résultats et état sont réécrits via un fichier
-  temporaire puis `os.replace`, donc une coupure ne laisse jamais de ligne à
-  moitié écrite.
-
-La concurrence est bornée par le **nombre de clés réellement disponibles**, pas
-par une constante : 7 clés qui atteignent le site donnent 7 navigateurs en
-parallèle. Ajouter une clé dans `.env` élargit automatiquement le pool.
-
-## Vérifier avant de lancer
-
-Un HTTP 200 sur `/v1/projects` ne prouve rien : un compte free répond à ses
-lectures même à zéro crédit. Le seul test honnête est d'ouvrir un vrai
-navigateur, de charger la page et de regarder ce qui revient.
-
-```bash
-python probe_reach.py                     # tous les fournisseurs, toutes les clés
-python probe_reach.py --transport kernel  # un seul
-```
-
-Sortie mesurée sur le 26/09/2026 :
-
-```
-[REACHES] browserbase ***7Kwitw http=200 form=ok
-[REACHES] kernel      ***Dfmh7Q http=200 form=ok
-reaches: 7  blocked: 0  total: 7
-  browserbase: 3/3 clés
-  kernel: 4/4 clés
-```
-
-`form=ok` signifie que le formulaire de connexion s'est réellement rendu. La
-page met environ 8 s à hydrater : interroger le DOM plus tôt décrit à tort une
-page saine comme vide.
-
-### Lancer le checker
-
-```bash
-python check_credits.py              # lecture seule, gratuit, aucun credit
-python check_credits.py --probe      # ouvre et ferme une vraie session par cle
-python check_credits.py --json       # sortie brute pour un script
-python check_credits.py --write-bak  # parque les cles epuisees dans .env.bak
-```
-
-Deux modes, et la difference est importante :
-
-| Mode | Ce qu'il fait | Cout |
-|---|---|---|
-| sans `--probe` | Lit `/subscription/`, `/org/limits`, `/v1/projects` | gratuit |
-| `--probe` | Cree puis detruit une vraie session par cle | consomme du credit |
-
-**Le mode gratuit ne detecte pas une cle epuisee.** Mesure faite le
-26/09/2026 sur `BROWSERBASE_API_KEY` :
-
-```
-sans --probe   -> [OK    ] browserbase BROWSERBASE_API_KEY ***7Kwitw http=200
-avec --probe   -> [SPENT ] browserbase BROWSERBASE_API_KEY ***7Kwitw http=402
-                 Free plan browser minutes limit reached.
-```
-
-`/v1/projects` renvoie 200 meme a zero credit : c'est une lecture de catalogue,
-pas de la consommation. Seul le probe consomme une minute et dit la verite.
-Quand un doute sur la consommation, `--probe` est le seul verdict fiable.
-
-**Codes de sortie** : `0` si aucune cle epuisee ou rejetee, `1` sinon. Donc
-utilisable tel quel comme garde-fou dans un script :
-
-```bash
-python check_credits.py || echo "au moins une cle est epuisee"
-```
-
-`--write-bak` fait deux choses : il commente la cle epuisee dans `.env` (elle
-sort donc du pool du scraper) et l'archive avec sa date de reset estimee dans
-`.env.bak`, ou elle sera reappliquee au prochain cycle. C'est ce qui evite au
-scraper de retenter une cle qui renvoie 402 a chaque run.
-
+Sur cette machine (IP datacenter), **Kernel est la voie fiable** : 4/4 sessions
+atteignent le formulaire en 6-9 s. Browserbase est intermittant (2/4, puis 429)
+et sert de secours.
 
 ## Tests
 
@@ -312,30 +297,26 @@ scraper de retenter une cle qui renvoie 402 a chaque run.
 python test_offline.py
 ```
 
-26 tests, sans navigateur ni crédit. Ils couvrent ce qui casse silencieusement :
+Sans navigateur ni crédit :
 
-- aucune clé perdue dans le pool, et attente correcte quand toutes sont prises ;
-- une clé marquée « essayée » n'est pas réattribuée au même compte ;
-- une clé morte (402) sort du pool ;
-- un verdict transitoire n'écrit **ni ligne ni état** ;
-- une donnée réelle survit à une tentative échouée ;
-- le classement rejouable/non rejouable des erreurs HTTP.
-
-Les tests écrivent dans un répertoire temporaire. Un `Store` pointant par
-défaut sur `result/` a déjà écrasé un vrai scrape pendant leur mise au point ;
-`Store(result_dir=...)` rend ce genre d'accident impossible.
+- classement rejouable/non rejouable des erreurs HTTP des transports ;
+- reconnaissance des types de comptes (`membre`/`escort`, `f`/`m`/`c`/`t`) ;
+- détection du premium payé (`oui`/`non`/vide) ;
+- la meta description ne l'emporte jamais sur le panneau `Sexe:` ;
+- extraction de la date d'inscription et de la dernière connexion ;
+- dédup des cibles, reprise par couple `(user, password)`, et sorties qui ne
+  perdent pas les verdicts précédents (`history.txt` append-only).
 
 ## Sécurité
 
-- `.env`, `.env.bak`, `credentials.txt`, `result/` et les dumps sont ignorés
-  par git. **Vérifiez `git status` avant le premier commit.**
-- `chmod 600` sur `.env` et `credentials.txt`.
-- Aucun secret n'est écrit dans le dépôt, et les clés n'apparaissent jamais en
-  clair dans les logs : seuls les 6 derniers caractères sont affichés.
-- Le token GitHub fourni pour le push ne doit être ni commité ni mis dans la
-  configuration git persistante. Utilisez-le pour le push uniquement.
-- Le dépôt est privé de préférence : les résultats contiennent des mots de passe
-  et des adresses réelles.
+- `.env`, `targets/`, `output/`, `meslibertines-profile/` et
+  `meslibertines-state.json` sont ignorés par git. **Vérifiez `git status` avant
+  le premier commit.**
+- `chmod 600` sur `.env` et `targets/accounts.txt`.
+- Aucun secret n'est écrit dans le dépôt ; les clés n'apparaissent jamais en
+  clair dans les logs (6 derniers caractères seulement).
+- Les résultats contiennent de vrais identifiants et de vraies IP : gardez le
+  dépôt privé.
 
 ## Licence
 

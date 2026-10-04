@@ -1,0 +1,3 @@
+# Un compte par ligne, format user:password.
+# Copier vers targets/accounts.txt (gitignore) et remplir.
+# Les lignes vides et les lignes commencant par # sont ignorees.

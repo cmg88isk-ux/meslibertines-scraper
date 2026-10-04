@@ -142,10 +142,18 @@ async def apply_identity(browser: Any) -> dict[str, Any]:
             },
         )
     with contextlib.suppress(Exception):
+        await cdp.send("Emulation.setTimezoneOverride", {"timezoneId": timezone})
+    with contextlib.suppress(Exception):
         await cdp.send("Network.setBlockedURLs", {"urls": BLOCKED_URL_PATTERNS})
     with contextlib.suppress(Exception):
         await cdp.detach()
-    return {"ua": ua, "version": full_version, "platform": platform_name, "locale": locale}
+    return {
+        "ua": ua,
+        "version": full_version,
+        "platform": platform_name,
+        "locale": locale,
+        "timezone": timezone,
+    }
 
 
 async def new_clean_context(browser: Any, locale: str = "fr-FR") -> Any:

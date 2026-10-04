@@ -1,9 +1,7 @@
 """Tests that need no browser and no API credits.
 
-The pool logic is the part that quietly loses work: a key that is not returned
-blocks every other worker, and a verdict that is cached as final can never be
-retried. Both failures are invisible in a normal run and expensive in a real
-one, so they are pinned down here.
+Covers the shared transport error classification, the meslibertines account
+type/premium parser, and the target dedup / resume / output logic.
 
     python test_offline.py
 """
@@ -11,14 +9,13 @@ one, so they are pinned down here.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import tempfile
+from pathlib import Path
 
-import scrape_multi as sm
-from extract import attempt_key, is_success_line
-from transports import TransportError
-from yomoni import BAD_CREDENTIALS, BLOCKED, OK, Outcome
+import check_meslibertines as cm
+import meslibertines_profile as mp
+from transports import TransportError, _classify
 
 FAILURES: list[str] = []
 
@@ -31,171 +28,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def temp_store() -> sm.Store:
-    """A store writing to a throwaway directory.
-
-    The real Store defaults to result/; a test that used it directly would
-    overwrite an actual scrape, which is exactly what happened once already.
-    """
-    return sm.Store(result_dir=tempfile.mkdtemp(prefix="yomoni-test-"))
-
-
-class FakeTransport:
-    def __init__(self, name: str, keys: list[str]) -> None:
-        self.name = name
-        self._keys = keys
-
-    def keys(self) -> list[str]:
-        return list(self._keys)
-
-
-async def test_pool_returns_every_key() -> None:
-    """Every key must come back after use, or the pool starves."""
-    pool = sm.SlotPool([FakeTransport("t", ["k1", "k2", "k3"])])
-    slots = []
-    for _ in range(3):
-        slot = await pool.take()
-        assert slot is not None
-        slots.append(slot)
-    check("pool: 3 cles prises", len(slots) == 3)
-
-    for slot in slots:
-        await pool.give_back(slot)
-    recovered = []
-    for _ in range(3):
-        slot = await pool.take(avoid=set())
-        assert slot is not None
-        recovered.append(slot[1])
-    check("pool: toutes les cles rendues", sorted(recovered) == ["k1", "k2", "k3"], f"-> {recovered}")
-
-
-async def test_pool_avoids_and_waits() -> None:
-    """A retry must skip the key that just failed, and wait for a busy one."""
-    pool = sm.SlotPool([FakeTransport("t", ["k1", "k2"])])
-    first = await pool.take()
-    check("pool: premiere cle", first is not None and first[1] == "k1")
-
-    # k1 is held elsewhere; ask for something that is not k2.
-    task = asyncio.create_task(pool.take(avoid={"k2"}))
-    await asyncio.sleep(0.1)
-    check("pool: attend une cle occupee", not task.done())
-    await pool.give_back(first)  # type: ignore[arg-type]
-    second = await asyncio.wait_for(task, timeout=5)
-    check("pool: evite la cle interdite", second is not None and second[1] == "k1", f"-> {second}")
-
-
-async def test_pool_gives_none_when_all_avoided() -> None:
-    pool = sm.SlotPool([FakeTransport("t", ["k1", "k2"])])
-    result = await pool.take(avoid={"k1", "k2"})
-    check("pool: None si tout evite", result is None)
-
-
-async def test_pool_discards_dead_key() -> None:
-    pool = sm.SlotPool([FakeTransport("t", ["k1", "k2"])])
-    slot = await pool.take()
-    assert slot is not None
-    pool.discard(slot)
-    await pool.give_back(slot)
-    got = await pool.take()
-    check("pool: cle morte retiree", got is not None and got[1] == "k2", f"-> {got}")
-    await pool.give_back(got)  # type: ignore[arg-type]
-
-
-async def test_transient_outcome_is_not_cached() -> None:
-    """A blocked account must stay retryable; a rejection must not."""
-    store = temp_store()
-    await store.record("a@b.fr", "pwd", Outcome(BLOCKED, [], "cf challenge"), "ignored")
-    check(
-        "etat: transitoire non memorise",
-        store.known("a@b.fr", "pwd") is None,
-        f"-> {store.known('a@b.fr', 'pwd')}",
-    )
-    check("etat: aucune ligne ecrite", store.lines == [], f"-> {store.lines}")
-
-    await store.record("a@b.fr", "pwd", Outcome(BAD_CREDENTIALS, [], "Identifiants incorrects"), "a@b.fr|mdp|||inconnu|x")
-    check("etat: rejet memorise", store.known("a@b.fr", "pwd") == BAD_CREDENTIALS)
-    check("etat: ligne de rejet ecrite", len(store.lines) == 1)
-
-
-async def test_success_is_never_overwritten_by_failure() -> None:
-    """Real account data must outlive a later failed attempt on the same mail."""
-    store = temp_store()
-    good = "good@g.fr|secret|||oui|montant 12,00 €"
-    store.lines, store.entries["good@g.fr"] = [good], "secret"
-
-    await store.record("good@g.fr", "secret", Outcome(BAD_CREDENTIALS, [], "nope"), "good@g.fr|mdp|||inconnu|x")
-    check("donnees: succes preserve", store.lines == [good], f"-> {store.lines}")
-
-    await store.record("good@g.fr", "secret", Outcome(OK, [{"text": "nouveau"}]), "good@g.fr|secret|||oui|nouveau")
-    check("donnees: relu ecrase l'ancien", store.lines[0].endswith("nouveau"))
-
-
-def test_failure_markers_never_look_like_passwords() -> None:
-    check("marqueur: mdp change", not is_success_line("mot de passe changé"))
-    check("marqueur: 2FA", not is_success_line("2FA requise"))
-    check("marqueur: vrai mdp", is_success_line("VraiMotDePasse1!"))
-
-
-def test_credentials_parser() -> None:
-    """Parser checks run on a fixture, not on the real credentials.txt.
-
-    credentials.txt is gitignored on purpose, so a fresh clone has none: a test
-    that reads it fails everywhere except the machine that produced it. That
-    is exactly what a clone test caught.
-    """
-    fixture = os.path.join(tempfile.mkdtemp(prefix="yomoni-creds-"), "credentials.txt")
-    with open(fixture, "w", encoding="utf-8") as f:
-        f.write(
-            "# commentaire\n"
-            "\n"
-            "dup@example.com:motdepasse1\n"
-            "DUP@example.com:motdepasse1\n"      # doublon exact, meme casse differente
-            "AUTRE@Example.com:motdepasse2\n"
-            "sans-separateur\n"
-            "vide@example.com:\n"
-            ":orphelin\n"
-            "deux@example.com:p1\n"
-            "deux@example.com:p2\n"              # meme mail, mdp differents
-        )
-    accounts = sm.read_all_credentials(fixture)
-    emails = [e for e, _ in accounts]
-    pairs = set(accounts)
-    check("parser: doublon exact ecarte", len(pairs) == len(accounts), f"-> {accounts}")
-    check("parser: email normalise", all(e == e.lower() for e in emails), f"-> {emails}")
-    check("parser: ligne sans ':' ignoree", "sans-separateur" not in emails)
-    check("parser: champ vide ignore", "vide@example.com" not in emails)
-    check("parser: orphelin ignore", "" not in emails)
-    check("parser: commentaire ignore", len(accounts) == 4, f"-> {len(accounts)}")
-    # Both passwords for one address are kept: that is how a corrected password
-    # gets tested without erasing the history of the previous one.
-    check(
-        "parser: 2 mdp pour un meme mail conserves",
-        sum(1 for e, _ in accounts if e == "deux@example.com") == 2,
-    )
-
-
-def test_real_credentials_if_present() -> None:
-    """Extra check on the live file, skipped when there is none."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.txt")
-    if not os.path.exists(path):
-        print("  SKIP  fichier credentials.txt absent (normal sur un clone)")
-        return
-    accounts = sm.read_all_credentials(path)
-    check("credentials: aucun doublon exact", len(accounts) == len(set(accounts)))
-    check("credentials: emails normalises", all(e == e.lower() for e, _ in accounts))
-    check("credentials: aucun champ vide", all(e and p for e, p in accounts))
-
-
-def test_attempt_key_distinguishes_passwords() -> None:
-    """Two passwords for one mail must not overwrite each other's record."""
-    a = attempt_key("x@y.fr", "p1")
-    b = attempt_key("x@y.fr", "p2")
-    check("cle: 2 mdp -> 2 entrees", a != b)
-
-
 def test_transport_error_classification() -> None:
-    from transports import _classify
-
     check("classement: 402 non reessayable", not _classify(402, "quota reached").retryable)
     check("classement: 401 credits non reessayable", not _classify(401, "insufficient credits").retryable)
     check("classement: 401 invalide non reessayable", not _classify(401, "invalid api key").retryable)
@@ -204,21 +37,195 @@ def test_transport_error_classification() -> None:
     check("classement: erreur transporte", isinstance(_classify(500, "x"), TransportError))
 
 
-async def main() -> int:
-    print("pool de cles")
-    await test_pool_returns_every_key()
-    await test_pool_avoids_and_waits()
-    await test_pool_gives_none_when_all_avoided()
-    await test_pool_discards_dead_key()
-    print("persistance et dedup")
-    await test_transient_outcome_is_not_cached()
-    await test_success_is_never_overwritten_by_failure()
-    test_failure_markers_never_look_like_passwords()
-    test_attempt_key_distinguishes_passwords()
-    test_credentials_parser()
-    test_real_credentials_if_present()
+def test_meslibertines_account_types() -> None:
+    """Every account nature and sub-type must be told apart.
+
+    Fixtures are real captures, kept short. URLs decide member vs escort; the
+    profile ``Sexe:`` panel decides f/m/c/t.
+    """
+    femme = "NOTIONS | PERSONNELS | Sexe: | Femme | Ethnique: | Caucasien | Âge: | 22 | Ville de base: | Tarbes"
+    trans = "Sexe: | Transexuelle | Ethnique: | Latin | Âge: | 28"
+    couple = "Sexe: | Couple | Ethnique: | Latin | Âge: | 20"
+    homme = "Sexe: | Homme | Ethnique: | Latin | Âge: | 35"
+    member = "Inscrit: 11/01/2023 | La dernière connexion: 04/10/2026 16:07 | Âge:0 | Sexe:L'homme | Ville:Évreux"
+
+    check("membre: url", mp.detect_kind("https://www.meslibertines.com/member/eudesfre/") == mp.KIND_MEMBER)
+    check("escort: url", mp.detect_kind("https://www.meslibertines.com/escort/Adriana-965519/") == mp.KIND_ESCORT)
+    check("nature: url inconnue -> vide", mp.detect_kind("https://www.meslibertines.com/") == "")
+
+    check("type: femme -> f", mp.detect_type(femme) == mp.TYPE_FEMME)
+    check("type: trans -> t", mp.detect_type(trans) == mp.TYPE_TRANS)
+    check("type: couple -> c", mp.detect_type(couple) == mp.TYPE_COUPLE)
+    check("type: homme -> m", mp.detect_type(homme) == mp.TYPE_HOMME)
+    check("type: membre L'homme -> m", mp.detect_type(member) == mp.TYPE_HOMME)
+    check("type: absent -> vide", mp.detect_type("aucune mention") == "")
+
+    # The meta description calls a trans profile a "femme"; it must not win.
+    deceptive = "est une latin femme à Metz | Sexe: | Transexuelle"
+    check("type: la meta femme ne gagne pas sur Sexe", mp.detect_type(deceptive) == mp.TYPE_TRANS)
+
+    femme_p = mp.parse_profile("https://www.meslibertines.com/escort/Adriana-965519/", femme)
+    check("parse: escort id", femme_p["id"] == "965519", f"-> {femme_p['id']}")
+    check("parse: escort type", femme_p["type"] == "f")
+    check("parse: label femme", femme_p["label"] == "femme")
+    check("parse: ville", femme_p["city"] == "Tarbes", f"-> {femme_p['city']}")
+
+    member_p = mp.parse_profile(
+        "https://www.meslibertines.com/member/eudesfre/ "
+        "/member/rankings/1419361/",
+        member,
+    )
+    check("parse: membre kind", member_p["kind"] == mp.KIND_MEMBER)
+    check("parse: membre inscrit", member_p["inscrit"] == "11/01/2023", f"-> {member_p['inscrit']}")
+    check("parse: membre derniere connexion", member_p["last_seen"] == "04/10/2026 16:07")
+    check("parse: membre age", member_p["age"] == "0")
+
+
+def test_premium_detection() -> None:
+    """Premium is read from the advertiser dashboard's Abonnement block."""
+    non_premium = (
+        '<div class="package-holder no-icons-list"><div class="list-header">Abonnement</div>'
+        '<div class="free-package bordered-medium"><p class="title">'
+        "(vous ne disposez pas d'un paquet)</p>"
+        '<a class="go-premium" href="/orders/step1/">go premium maintenant</a></div></div>'
+    )
+    premium = (
+        '<div class="package-holder no-icons-list"><div class="list-header">Abonnement</div>'
+        '<div class="premium-package"><p class="title">Pack Gold</p>'
+        "<p>Expire le 01/01/2027</p></div></div>"
+    )
+    member = "<div class='member_dashes'>Bienvenue dans votre espace prive</div>"
+
+    check("premium: paquet absent -> non", mp.detect_premium(non_premium) == mp.PREMIUM_NO)
+    check("premium: paquet actif -> oui", mp.detect_premium(premium) == mp.PREMIUM_YES)
+    check("premium: page membre -> vide", mp.detect_premium(member) == "")
+
+
+def test_targets_dedup_keeps_other_passwords() -> None:
+    """An exact duplicate is dropped; the same user with another password stays."""
+    directory = Path(tempfile.mkdtemp(prefix="ml-targets-"))
+    (directory / "a.txt").write_text(
+        "# commentaire\n"
+        "\n"
+        "a@x.fr:p1\n"
+        "a@x.fr:p1\n"          # doublon exact -> ecarte
+        "a@x.fr:p2\n"          # meme pseudo, autre mdp -> garde
+        "b:p1\n"
+        "ligne-sans-separateur\n"
+        ":orphelin\n"
+        "vide:\n",
+        encoding="utf-8",
+    )
+    accounts = cm.read_targets(directory)
+    check("targets: doublon exact ecarte", len(accounts) == len(set(accounts)), f"-> {accounts}")
+    check("targets: meme pseudo autre mdp garde", ("a@x.fr", "p1") in accounts and ("a@x.fr", "p2") in accounts)
+    check(
+        "targets: ordre et lignes ignorees",
+        accounts == [("a@x.fr", "p1"), ("a@x.fr", "p2"), ("b", "p1")],
+        f"-> {accounts}",
+    )
+
+
+def test_resume_is_keyed_by_pair() -> None:
+    """Resume skips a resolved couple, never a new password for the same user."""
+    accounts = [("a", "p1"), ("a", "p2"), ("b", "p1")]
+    previous = [
+        {"user": "a", "password": "p1", "status": cm.STATUS_PASSWORD_FALSE},
+        {"user": "a", "password": "p2", "status": cm.STATUS_CHALLENGE},  # transitoire -> revient
+        {"user": "c", "password": "p9", "status": cm.STATUS_OK},
+    ]
+    todo = cm.pending_accounts(accounts, previous)
+    check("reprise: couple refuse saute", ("a", "p1") not in todo)
+    check("reprise: meme pseudo autre mdp retente", ("a", "p2") in todo)
+    check("reprise: compte neuf garde", ("b", "p1") in todo)
+    check("reprise: transitoire non saute", todo == [("a", "p2"), ("b", "p1")], f"-> {todo}")
+    check("redo: tout retente", cm.pending_accounts(accounts, previous, redo=True) == accounts)
+
+
+def test_outputs_do_not_overwrite_previous() -> None:
+    """A later run must keep earlier verdicts, and history is append-only."""
+    directory = Path(tempfile.mkdtemp(prefix="ml-out-"))
+    first = {
+        "user": "a", "password": "p1", "status": cm.STATUS_OK, "type": "m", "label": "homme",
+        "inscrit": "11/01/2023", "last_seen": "", "ip": "1.2.3.4", "provider": "kernel:***abc", "detail": "",
+    }
+    cm.write_results([first], directory)
+    previous = cm.load_previous(directory)
+    check("sorties: results.json relu", bool(previous) and previous[0]["user"] == "a", f"-> {previous}")
+    valid_text = (directory / "valid.txt").read_text().splitlines()
+    check("sorties: valid.txt a un en-tete", valid_text[0] == cm.VALID_HEADER, f"-> {valid_text[0]}")
+    check("sorties: valid.txt porte le type", any("|m|homme|" in line for line in valid_text))
+
+    second = dict(first)
+    second.update(
+        user="b", password="p2", status=cm.STATUS_PASSWORD_FALSE, type="", label="",
+        inscrit="", detail="identifiants invalides (site)",
+    )
+    cm.write_results(previous + [second], directory)
+    final = cm.load_previous(directory)
+    check(
+        "sorties: ancien verdict conserve",
+        {r["user"] for r in final} == {"a", "b"},
+        f"-> {[r['user'] for r in final]}",
+    )
+    invalid_text = (directory / "invalids.txt").read_text()
+    check("sorties: invalids.txt porte l'en-tete", invalid_text.splitlines()[0] == cm.INVALID_HEADER)
+    check("sorties: invalids.txt porte la cause", "b:p2|password=false|identifiants invalides (site)" in invalid_text)
+    check("sorties: results.txt porte l'en-tete", (directory / "results.txt").read_text().splitlines()[0] == cm.RESULTS_HEADER)
+
+    cm.append_history(first, directory)
+    cm.append_history(second, directory)
+    lines = (directory / "history.txt").read_text().strip().splitlines()
+    check("sorties: history append-only", len(lines) == 3 and lines[0] == cm.HISTORY_HEADER, f"-> {lines}")
+
+
+def test_keypool_and_no_keys() -> None:
+    """A dead key leaves the pool; an empty pool stops the account cleanly."""
+    pool = cm.KeyPool({"kernel": ["a", "b"], "browserbase": []}, ["kernel", "browserbase"])
+    check("pool: cles presentes", pool.any() and pool.counts()["kernel"] == 2, f"-> {pool.counts()}")
+    check("pool: ordre kernel", pool.ordered(0) == [("kernel", "a"), ("kernel", "b")], f"-> {pool.ordered(0)}")
+    check("pool: slot decale", pool.ordered(1)[0] == ("kernel", "b"), f"-> {pool.ordered(1)}")
+
+    asyncio.run(pool.discard("kernel", "a"))
+    asyncio.run(pool.discard("kernel", "b"))
+    check("pool: vide apres retrait", not pool.any(), f"-> {pool.counts()}")
+
+    result = asyncio.run(cm.check_account("u", "p", pool, 2))
+    check("pool: compte sans cle -> erreur claire", result["status"] == cm.STATUS_ERROR)
+    check(
+        "pool: message 'plus aucune cle'",
+        "plus aucune cle disponible" in result["detail"],
+        f"-> {result['detail']}",
+    )
+
+
+def test_history_row_migration() -> None:
+    """A pre-header history row (7 fields) is upgraded to the 9-field shape."""
+    directory = Path(tempfile.mkdtemp(prefix="ml-hist-"))
+    old_row = "2026-01-01T00:00:00+00:00|a:p|ok|m|1.2.3.4|kernel:***x|detail"
+    (directory / "history.txt").write_text(cm.HISTORY_HEADER + "\n" + old_row + "\n", encoding="utf-8")
+    cm.ensure_history_header(directory)
+    lines = (directory / "history.txt").read_text().splitlines()
+    check("history: header intact", lines[0] == cm.HISTORY_HEADER, f"-> {lines[0]}")
+    check("history: ancienne ligne -> 9 champs", len(lines[1].split("|")) == 9, f"-> {lines[1]}")
+    check("history: type conserve", lines[1].split("|")[4] == "m", f"-> {lines[1]}")
+    check("history: idempotent", cm.ensure_history_header(directory) and
+          (directory / "history.txt").read_text().splitlines()[1] == lines[1])
+
+
+def main() -> int:
     print("transports")
     test_transport_error_classification()
+    print("meslibertines: types de comptes")
+    test_meslibertines_account_types()
+    print("meslibertines: premium")
+    test_premium_detection()
+    print("meslibertines: cibles, reprise, sorties")
+    test_targets_dedup_keeps_other_passwords()
+    test_resume_is_keyed_by_pair()
+    test_outputs_do_not_overwrite_previous()
+    test_keypool_and_no_keys()
+    test_history_row_migration()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} test(s) en echec: {', '.join(FAILURES)}")
@@ -228,4 +235,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())
