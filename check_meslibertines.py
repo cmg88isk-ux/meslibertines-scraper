@@ -203,23 +203,27 @@ def random_session(provider: str) -> dict[str, Any]:
 
     The per-session identity itself comes from ``hygiene.apply_identity`` (shared
     by every entry point); this only seeds what the provider must set at
-    session-creation time, which CDP cannot change afterwards.
+    session-creation time, which CDP cannot change afterwards. It is passed on
+    to ``apply_identity`` too, so the CDP identity matches rather than re-rolls
+    and the two layers cannot contradict each other.
     """
     width, height = random.choice(SCREENS)
     locale = random.choice(LOCALES)
     timezone = random.choice(TIMEZONES)
+    platform = random.choice(("Windows", "macOS", "Linux"))
     viewport = {"width": width, "height": height}
+    common = {"platform": platform, "locale": locale, "timezone": timezone, "viewport": viewport}
     if provider == "browserbase":
         return {
+            **common,
             "fingerprint": {
                 "screen": {"minWidth": width, "maxWidth": width, "minHeight": height, "maxHeight": height},
                 "locale": locale,
                 "languages": [locale, locale.split("-")[0], "en"],
                 "timezone": timezone,
             },
-            "viewport": viewport,
         }
-    return {"locale": locale, "timezone": timezone}
+    return common
 
 
 def make_transport(provider: str, keys: list[str], settings: dict[str, Any]):
@@ -302,7 +306,7 @@ async def check_once(
             # context swap is needed.
             if hygiene:
                 with contextlib.suppress(Exception):
-                    identity = await apply_identity(browser)
+                    identity = await apply_identity(browser, settings)
                     result["detail"] = f"id={identity.get('platform','')}/{identity.get('locale','')}"
 
             result["ip"] = await exit_ip(browser, context)

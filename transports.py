@@ -141,7 +141,14 @@ class BrowserbaseTransport:
                     headers={"X-BB-API-Key": key, "Content-Type": "application/json"},
                     json={
                         "projectId": project_id,
-                        "browserSettings": {**_BROWSER_SETTINGS, **self.settings},
+                        # Only the keys Browserbase understands go into
+                        # browserSettings; identity hints (platform/locale/...)
+                        # ride alongside for apply_identity and must not be sent
+                        # as unknown fields here.
+                        "browserSettings": {
+                            **_BROWSER_SETTINGS,
+                            **{k: v for k, v in self.settings.items() if k in ("fingerprint", "viewport")},
+                        },
                         "timeout": self.timeout_s,
                     },
                 )

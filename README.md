@@ -264,18 +264,22 @@ indique tout de même « femme », seul le panneau `Sexe:` fait foi.
 
 ## Modèle anti-détection
 
-**IP qui change.** Chaque tentative ouvre une session neuve, et Kernel comme
-Browserbase sortent d'une IP différente à chaque session (vérifié : 6 sessions
-Kernel = 6 IP distinctes). Aucun code de rotation n'est nécessaire au-delà du
-choix de la clé.
+**IP qui change.** Chaque tentative ouvre une session neuve. **Kernel** sort
+d'une IP unique à chaque session (mesuré : 5 sessions = 5 IP distinctes,
+`verify_rotation.py`). **Browserbase** (plan gratuit) partage un pool datacenter :
+ses IP peuvent se répéter d'une session à l'autre — la rotation n'y est pas
+garantie, d'où Kernel en provider principal. Le checker ne réutilise jamais la
+clé/IP qui vient d'échouer (`KeyPool.ordered`).
 
 **Fingerprint.** Le User-Agent n'est **jamais** forcé sur une version plus
 ancienne que le navigateur réel : ce désaccord faisait boucler le challenge
 Turnstile. `hygiene.apply_identity` injecte à la place un UA épinglé au vrai
 build Chrome, avec des Client Hints cohérents, une locale/timezone française et
-le blocage des analytics/polices/médias (`Network.setBlockedURLs`). Côté
-Browserbase, une empreinte aléatoire (taille d'écran, viewport, langue) est
-passée à la création de session.
+le blocage des analytics/polices/médias (`Network.setBlockedURLs`). La session
+est tirée **une seule fois** (plateforme, locale, timezone, viewport) côté
+provider, puis transmise à `apply_identity` : les deux couches ne peuvent donc
+pas se contredire. `verify_rotation.py` mesure le résultat (5 sessions Kernel :
+5 IP et 5 fingerprints distincts, `navigator.webdriver` absent).
 
 **Rotation des providers.** Le checker alterne Kernel et Browserbase, et les
 clés entre elles : une nouvelle tentative ne réutilise jamais l'IP qui vient

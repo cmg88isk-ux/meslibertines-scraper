@@ -57,8 +57,18 @@ PLATFORMS = [
     ("Linux", "X11; Linux x86_64"),
 ]
 LOCALES = ("fr-FR", "fr-FR", "fr-FR", "fr-BE", "fr-CH")
-VIEWPORTS = [(1920, 1080), (1536, 864), (1660, 900), (1440, 900)]
-TIMEZONES = ("Europe/Paris", "Europe/Paris", "Europe/Paris", "Europe/Brussels")
+VIEWPORTS = [
+    (1920, 1080),
+    (1536, 864),
+    (1660, 900),
+    (1440, 900),
+    (1680, 1050),
+    (1600, 900),
+    (1366, 768),
+    (1280, 800),
+    (2560, 1440),
+]
+TIMEZONES = ("Europe/Paris", "Europe/Paris", "Europe/Paris", "Europe/Brussels", "Europe/Zurich")
 
 # Makes navigator.webdriver undefined, which is the single most checked flag.
 STEALTH_SCRIPT = """
@@ -86,20 +96,37 @@ async def chrome_version(browser: Any) -> str:
             await cdp.detach()
 
 
-async def apply_identity(browser: Any) -> dict[str, Any]:
+async def apply_identity(browser: Any, settings: dict[str, Any] | None = None) -> dict[str, Any]:
     """Give this session its own plausible desktop identity.
 
     The UA string and the Client Hints must agree: servers compare
     ``User-Agent`` against ``sec-ch-ua`` and a mismatched pair is a stronger
     signal than either value on its own. Pinning both to the real build is what
     makes the override invisible.
+
+    ``settings`` (the provider's per-session values) can pin platform/locale/
+    timezone so the identity CDP installs matches the one the cloud provider set
+    at session creation; without it each layer would roll its own and the two
+    could disagree.
     """
+    settings = settings or {}
     version = await chrome_version(browser)
     major = version.split(".")[0] if version else "140"
-    platform_name, platform_token = random.choice(PLATFORMS)
-    locale = random.choice(LOCALES)
-    width, height = random.choice(VIEWPORTS)
-    timezone = random.choice(TIMEZONES)
+    platform_choice = settings.get("platform")
+    if platform_choice:
+        platform_tokens = {"Windows": "Windows NT 10.0; Win64; x64",
+                           "macOS": "Macintosh; Intel Mac OS X 10_15_7",
+                           "Linux": "X11; Linux x86_64"}
+        platform_name, platform_token = platform_choice, platform_tokens.get(platform_choice, platform_tokens["Windows"])
+    else:
+        platform_name, platform_token = random.choice(PLATFORMS)
+    locale = settings.get("locale") or random.choice(LOCALES)
+    viewport = settings.get("viewport") or {}
+    if viewport.get("width"):
+        width, height = viewport["width"], viewport.get("height", 1080)
+    else:
+        width, height = random.choice(VIEWPORTS)
+    timezone = settings.get("timezone") or random.choice(TIMEZONES)
 
     full_version = version if "." in version else f"{major}.0.0.0"
     ua = (
