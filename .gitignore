@@ -32,6 +32,10 @@ targets/*
 !targets/accounts.txt.example
 output/*
 !output/.gitkeep
+# Memes fichiers, variantes de travail ciblees (VIP) et sorties paralleles.
+targets_vip/
+output_vip/
+output_vip2/
 yomoni_results.txt
 verify-*.jsonl
 verify-*.txt

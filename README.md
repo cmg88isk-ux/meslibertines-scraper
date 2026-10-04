@@ -4,11 +4,11 @@ Vérificateur de comptes pour `meslibertines.com`.
 
 Lit une liste de comptes, ouvre un navigateur cloud neuf pour chacun, franchit le
 challenge Cloudflare/Turnstile, se connecte, puis classe le compte : nature
-(`membre` client ou `escort` annonceur), type (`femme` / `homme` / `couple` /
-`trans`), abonnement `premium` payé ou non, date d'inscription et dernière
-connexion. Un mot de passe refusé est écrit `password=false`, preuve du site à
-l'appui. Les navigateurs vivent chez Kernel et Browserbase, pilotés en CDP :
-aucun navigateur local n'est requis.
+(`membre` client, `escort` annonceur ou `multi` gestion), type (`femme` / `homme`
+/ `couple` / `trans`), abonnement `premium` payé ou non, date d'inscription et
+dernière connexion. Un mot de passe refusé est écrit `password=false`, preuve du
+site à l'appui. Les navigateurs vivent chez Kernel et Browserbase, pilotés en
+CDP : aucun navigateur local n'est requis.
 
 ---
 
@@ -125,8 +125,8 @@ python check_meslibertines.py
 # Plus de tentatives par compte (nouvelle IP à chaque essai)
 python check_meslibertines.py --tries 2
 
-# Plusieurs comptes en parallele (N workers = N cles, defaut: nb de cles, max 8)
-python check_meslibertines.py --concurrency 8
+# Plusieurs comptes en parallele (N workers = N cles; Kernel plafonne a 5 sessions)
+python check_meslibertines.py --concurrency 4
 
 # Tout re-tester, même les comptes déjà résolus
 python check_meslibertines.py --redo
@@ -151,9 +151,15 @@ inutile). Les échecs transitoires (`challenge`, `error`) ne sont pas enregistr�
 comme définitifs et reviennent au prochain run, sans repayer les comptes réussis.
 
 **Parallélisme.** `--concurrency N` fait tourner N comptes en même temps, chacun
-sur une clé/IP distincte (défaut : nombre de clés, plafonné à 8). Sur un gros
-`targets/`, c'est ce qui rend le run praticable (≈5 min/100 comptes au lieu de
-≈20 min).
+sur une clé/IP distincte. Kernel plafonne à **5 sessions simultanées par org**,
+donc le défaut est `min(nb de clés, 4)`. Au-delà, l'API renvoie 429 : le checker
+met alors en pause et réessaie (il ne marque pas le compte en échec).
+
+**Sessions orphelines.** Un arrêt dur (kill) n'exécute pas le code de fermeture
+et laisse des sessions Kernel ouvertes, qui saturent le plafond de 5 et font
+échouer toutes les nouvelles en 429. Au démarrage, le préflight **libère ces
+sessions**. Un verrou `output/.lock` empêche aussi deux runs simultanés de se
+marcher dessus.
 
 **Plus de clés.** Si une clé répond 402/401 (crédits épuisés ou refusée), elle
 est retirée du pool en cours de route. Quand il n'en reste aucune, le run
@@ -184,15 +190,19 @@ commence par une **ligne d'en-tête** indiquant les colonnes :
 
 | Fichier | Contenu |
 |---|---|
-| `valid.txt` | comptes OK : `mail:mdp\|kind\|type\|label\|premium\|inscrit\|last_seen` |
+| `valid.txt` | comptes OK : `mail:mdp\|kind\|type\|label\|premium\|jours_vip\|inscrit\|last_seen` |
+| `premium.txt` | annonceurs premium actifs : `mail:mdp\|kind\|type\|label\|premium\|jours_vip` |
 | `invalids.txt` | comptes non OK : `mail:mdp\|cause\|detail` |
-| `results.txt` | table complète : `mail:mdp\|status\|kind\|type\|label\|premium\|inscrit\|last_seen\|ip\|provider\|detail` |
+| `results.txt` | table complète : `mail:mdp\|status\|kind\|type\|label\|premium\|jours_vip\|inscrit\|last_seen\|ip\|provider\|detail` |
 | `results.json` | mêmes lignes, structurées (sert aussi à la reprise) |
-| `history.txt` | journal append-only, jamais tronqué (`date\|mail:mdp\|status\|kind\|type\|premium\|ip\|provider\|detail`) |
+| `history.txt` | journal append-only, jamais tronqué (`date\|mail:mdp\|status\|kind\|type\|premium\|jours_vip\|ip\|provider\|detail`) |
 
 `kind` = `membre` ou `escort`. `premium` = `oui` / `non` pour un compte
 annonceur (bloc `Abonnement` du dash : `.free-package` → `non`, paquet actif →
-`oui`), vide pour un membre (pas d'abonnement).
+`oui`), vide pour un membre (pas d'abonnement). `jours_vip` = nombre de jours
+VIP restants pour un annonceur premium (compte à rebours du site, sinon date de
+fin convertie en jours), vide sinon. `premium.txt` ne garde que les annonceurs à
+paquet actif (`premium=oui`) avec leurs jours VIP (`0` = paquet épuisé).
 
 `invalids.txt` distingue la cause : `password=false` (refus franc du site,
 preuve à l'appui), `challenge` (Cloudflare non franchi, rejouable), `noform`,
@@ -229,6 +239,7 @@ l'atterrissage après connexion (et sur l'URL du profil) :
 |---|---|---|---|
 | `membre` (client) | `/member_dashes/` | `/member/<slug>/` | genre du compte |
 | `escort` (annonceur) | `/profiles/dash/` | `/escort/<slug>-<id>/` | genre de l'annonce + premium |
+| `multi` (gestion multi-escortes) | `/multi_dashes/` | — | pas de genre unique |
 
 Le sous-type vient du genre déclaré (`data[gender]` du formulaire d'édition pour
 un membre, panneau `Sexe:` du profil public sinon), avec les **mêmes codes que le
@@ -243,7 +254,10 @@ site** :
 
 Le **premium payé** ne concerne que les annonceurs : il est lu dans le bloc
 `Abonnement` du dash (`non` si `.free-package` « vous ne disposez pas d'un
-paquet », `oui` si un paquet est actif, vide pour un membre).
+paquet », `oui` si un paquet est actif, vide pour un membre). Quand un paquet est
+actif, le **nombre de jours VIP restants** (`jours_vip`) est lu au même endroit :
+compte à rebours « X jours restants » si présent, sinon date de fin
+(« Expire le JJ/MM/AAAA ») convertie en jours depuis aujourd'hui.
 
 La meta description est ignorée volontairement : pour un profil trans elle
 indique tout de même « femme », seul le panneau `Sexe:` fait foi.
@@ -302,6 +316,7 @@ Sans navigateur ni crédit :
 - classement rejouable/non rejouable des erreurs HTTP des transports ;
 - reconnaissance des types de comptes (`membre`/`escort`, `f`/`m`/`c`/`t`) ;
 - détection du premium payé (`oui`/`non`/vide) ;
+- jours VIP restants (compte à rebours ou date de fin convertie en jours) ;
 - la meta description ne l'emporte jamais sur le panneau `Sexe:` ;
 - extraction de la date d'inscription et de la dernière connexion ;
 - dédup des cibles, reprise par couple `(user, password)`, et sorties qui ne

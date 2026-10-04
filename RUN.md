@@ -45,7 +45,7 @@ résolu (`ok` / `password=false`) n'est jamais re-testé (0 crédit).
 ### Options
 
 ```bash
-python check_meslibertines.py --concurrency 8    # 8 comptes en parallele (defaut: nb de cles, max 8)
+python check_meslibertines.py --concurrency 4    # 4 comptes en parallele (defaut: min(nb de cles, 4))
 python check_meslibertines.py --tries 2          # plus de tentatives (fallback clé/IP)
 python check_meslibertines.py --redo             # tout re-tester, même les résolus
 python check_meslibertines.py --order browserbase,kernel
@@ -65,6 +65,10 @@ Sans activer le venv, préfixer par `.venv/bin/python` :
 Le checker écrit `output/` après **chaque** compte. Tu peux l'arrêter quand tu
 veux (Ctrl-C ou `kill <PID>`) : relancer la même commande **reprend** exactement
 où il en était (les comptes `ok` / `password=false` ne sont pas refaits).
+
+Au démarrage, le checker libère les sessions Kernel orphelines laissées par un
+arrêt dur (sinon l'API Kernel renvoie 429) et pose un verrou `output/.lock` :
+**un seul run à la fois**.
 
 ### Plus de clés disponibles
 
@@ -101,15 +105,20 @@ python login_meslibertines.py --via local --chrome --manual   # navigateur local
 - **Sortie** (`output/`, chaque fichier commence par une ligne d'en-tête) :
 
 ```
-valid.txt     mail:mdp|kind|type|label|premium|inscrit|last_seen
+valid.txt     mail:mdp|kind|type|label|premium|jours_vip|inscrit|last_seen
+premium.txt   mail:mdp|kind|type|label|premium|jours_vip   (annonceurs premium seuls)
 invalids.txt  mail:mdp|cause|detail
-results.txt   mail:mdp|status|kind|type|label|premium|inscrit|last_seen|ip|provider|detail
+results.txt   mail:mdp|status|kind|type|label|premium|jours_vip|inscrit|last_seen|ip|provider|detail
 results.json  mêmes données, structurées (reprise)
 history.txt   journal append-only
 ```
 
-`kind` = `membre` / `escort` · `type` = `f` femme / `m` homme / `c` couple /
-`t` trans · `premium` = `oui` / `non` (annonceur) / vide (membre).
+`kind` = `membre` / `escort` / `multi` · `type` = `f` femme / `m` homme /
+`c` couple / `t` trans · `premium` = `oui` / `non` (annonceur) / vide (membre
+ou multi) · `jours_vip` = jours VIP restants (escort premium), vide sinon.
+
+`premium.txt` ne liste que les annonceurs dont un paquet est **actif**
+(`premium=oui`), avec le nombre de jours VIP restants (`0` = paquet épuisé).
 
 Statuts : `ok`, `password=false`, `challenge`, `noform`, `error`.
 

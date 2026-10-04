@@ -1,0 +1,5 @@
+# Project lint settings. The codebase is written for a 120-column terminal;
+# nothing here is longer, and `ruff check --select F,E9` must stay clean.
+line-length = 120
+target-version = "py311"
+exclude = [".venv", "meslibertines-profile", "__pycache__", "output", "targets"]
