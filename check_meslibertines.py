@@ -788,7 +788,7 @@ async def main() -> int:
         print(f"\necrit -> {output_dir}/valid.txt / invalids.txt / results.txt / history.txt")
         return 0
 
-    lock = asyncio.Lock()
+    write_lock = asyncio.Lock()
     queue: asyncio.Queue = asyncio.Queue()
     for account in todo:
         queue.put_nowait(account)
@@ -811,7 +811,7 @@ async def main() -> int:
                     "detail": f"{type(exc).__name__}: {str(exc)[:120]}", "key_dead": "",
                 }
             result["password"] = password
-            async with lock:
+            async with write_lock:
                 results[:] = [r for r in results if (r["user"], r.get("password", "")) != (user, password)]
                 results.append(result)
                 # Ecriture apres chaque compte: un arret conserve la progression.
